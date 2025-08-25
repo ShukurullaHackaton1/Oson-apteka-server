@@ -1,113 +1,53 @@
-// services/osonKassaSync.js
-const axios = require("axios");
+// services/osonKassaSync.js - Faqat frontend ma'lumotlarini qayta ishlash uchun
 const { Product, SyncStatus, Supplier } = require("../models");
-const cron = require("node-cron");
 
 class OsonKassaSyncService {
   constructor() {
-    this.baseURL = "https://osonkassa.uz/api";
     this.isRunning = false;
-    this.pageSize = 100;
   }
 
-  // Получение данных с API
-  async fetchPage(pageNumber) {
-    try {
-      const response = await axios.post(
-        `${this.baseURL}/report/inventory/remains`,
-        {
-          pageNumber,
-          pageSize: this.pageSize,
-          searchText: "",
-          sortOrders: [
-            {
-              property: "product",
-              direction: "asc",
-            },
-          ],
-          source: 0,
-          onlyActiveItems: true,
-          manufacturerIds: [],
-        },
-        {
-          headers: {
-            Authorization:
-              "Bearer eyJhbGciOiJodHRwOi8vd3d3LnczLm9yZy8yMDAxLzA0L3htbGRzaWctbW9yZSNobWFjLXNoYTI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJ3ZWIuYXBpIiwiaXNzIjoiaHR0cHM6Ly9vc29ua2Fzc2EudXovd2ViLmFwaSIsImV4cCI6MTc1NjEwNjE1MywiaWF0IjoxNzU2MDIzMzUzLCJVc2VybmFtZSI6ImFwdGVrYSIsIlVzZXJJZCI6IjgxZWViMzFmLTFiZWMtNGM3MC1iOGJmLTYzMjk4MTdiY2NjZSIsIlRlbmFudElkIjoiYmlvZmFybXMiLCJwZXJtaXNzaW9ucyI6InNlY3VyaXR5Iiwicm9sZSI6IiIsIm5iZiI6MTc1NjAyMzM1M30.nBzaFgdk1S_fZiUYofUknvB2m-yAQPSWnNAKut9oWr8",
-          },
-          timeout: 30000,
-        }
-      );
+  // Ma'lumotlarni frontenddan qabul qilish va qayta ishlash
+  async syncFromFrontend(data) {
+    console.log("📡 Frontenddan kelgan ma'lumotlar qayta ishlanmoqda...");
 
-      return response.data.page;
-    } catch (error) {
-      console.error(`Ошибка при получении страницы ${pageNumber}:`, error);
-      throw error;
-    }
-  }
-
-  // Полная синхронизация всех страниц
-  async fullSync() {
     if (this.isRunning) {
-      console.log("Синхронизация уже запущена");
-      return;
+      throw new Error("Sinxronlash allaqachon ishlab turibdi");
     }
 
     this.isRunning = true;
-    let syncStatus = (await SyncStatus.findOne()) || new SyncStatus();
 
     try {
-      console.log("🔄 Начало полной синхронизации с Oson Kassa...");
-      syncStatus.status = "syncing";
-      syncStatus.lastSyncDate = new Date();
-      await syncStatus.save();
+      const startTime = Date.now();
+      const processedCount = await this.processDataBatch(data.items || []);
 
-      // Получаем первую страницу для определения общего количества
-      const firstPage = await this.fetchPage(1);
-      const totalPages = firstPage.totalPages;
-      const totalCount = firstPage.totalCount;
-
-      console.log(`📊 Всего страниц: ${totalPages}, товаров: ${totalCount}`);
-
-      syncStatus.totalPages = totalPages;
-      syncStatus.totalRecords = totalCount;
-      await syncStatus.save();
-
-      // Синхронизируем все страницы
-      for (let page = 1; page <= totalPages; page++) {
-        console.log(`📄 Обработка страницы ${page}/${totalPages}`);
-
-        const pageData = await this.fetchPage(page);
-        await this.processPageData(pageData.items);
-
-        syncStatus.lastPageSynced = page;
-        await syncStatus.save();
-
-        // Небольшая задержка между запросами
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-
-      // Обновляем статистику поставщиков
+      // Yetkazib beruvchilar statistikasini yangilash
       await this.updateSupplierStatistics();
 
-      syncStatus.status = "completed";
-      syncStatus.nextSyncScheduled = new Date(Date.now() + 10 * 60 * 1000); // +10 минут
-      await syncStatus.save();
+      // Sync statusni yangilash
+      await this.updateSyncStatus("completed", processedCount, startTime);
 
-      console.log("✅ Полная синхронизация завершена");
+      console.log(
+        `✅ ${processedCount} ta mahsulot muvaffaqiyatli qayta ishlandi`
+      );
 
-      // Отправляем уведомление в Socket.io
+      // Socket.IO orqali xabar berish
       if (global.io) {
         global.io.emit("sync_completed", {
-          totalPages,
-          totalRecords: totalCount,
+          processedCount,
+          totalRecords: data.totalCount || processedCount,
           timestamp: new Date(),
         });
       }
+
+      return {
+        success: true,
+        processedCount,
+        totalRecords: data.totalCount || processedCount,
+        message: "Ma'lumotlar muvaffaqiyatli qayta ishlandi",
+      };
     } catch (error) {
-      console.error("❌ Ошибка синхронизации:", error);
-      syncStatus.status = "error";
-      syncStatus.errorMessage = error.message;
-      await syncStatus.save();
+      console.error("❌ Ma'lumotlarni qayta ishlashda xatolik:", error);
+      await this.updateSyncStatus("error", 0, Date.now(), error.message);
 
       if (global.io) {
         global.io.emit("sync_error", {
@@ -115,107 +55,101 @@ class OsonKassaSyncService {
           timestamp: new Date(),
         });
       }
+
+      throw error;
     } finally {
       this.isRunning = false;
     }
   }
 
-  // Инкрементальная синхронизация (только последняя страница)
-  async incrementalSync() {
-    if (this.isRunning) {
-      console.log("Синхронизация уже запущена");
-      return;
-    }
+  // Ma'lumotlar to'plamini qayta ishlash
+  async processDataBatch(items) {
+    let processedCount = 0;
+    let errorCount = 0;
 
-    this.isRunning = true;
-    const syncStatus = await SyncStatus.findOne();
+    console.log(`📦 ${items.length} ta mahsulot qayta ishlanmoqda...`);
 
-    if (!syncStatus || !syncStatus.lastPageSynced) {
-      console.log("Необходима полная синхронизация");
-      return await this.fullSync();
-    }
-
-    try {
-      console.log("🔄 Инкрементальная синхронизация...");
-
-      const pageData = await this.fetchPage(syncStatus.lastPageSynced);
-      await this.processPageData(pageData.items, true); // true = incremental update
-
-      syncStatus.lastSyncDate = new Date();
-      syncStatus.status = "completed";
-      syncStatus.nextSyncScheduled = new Date(Date.now() + 10 * 60 * 1000);
-      await syncStatus.save();
-
-      console.log("✅ Инкрементальная синхронизация завершена");
-    } catch (error) {
-      console.error("❌ Ошибка инкрементальной синхронизации:", error);
-    } finally {
-      this.isRunning = false;
-    }
-  }
-
-  // Обработка данных страницы
-  async processPageData(items, isIncremental = false) {
     for (const item of items) {
       try {
-        const productData = {
-          erpId: item.id,
-          branchId: item.branchId,
-          branch: item.branch,
-          productId: item.productId,
-          batchId: item.batchId,
-          code: item.code,
-          product: item.product,
-          manufacturer: item.manufacturer,
-          country: item.country,
-          internationalName: item.internationalName,
-          pharmGroup: item.pharmGroup,
-          category: item.category,
-          unit: item.unit,
-          pieceCount: item.pieceCount,
-          barcode: item.barcode,
-          mxik: item.mxik,
-          quantity: item.quantity,
-          quantities: item.quantities,
-          bookedQuantity: item.bookedQuantity,
-          buyPrice: item.buyPrice,
-          salePrice: item.salePrice,
-          vat: item.vat,
-          markup: item.markup,
-          series: item.series,
-          shelfLife: item.shelfLife ? new Date(item.shelfLife) : null,
-          supplyQuantity: item.supplyQuantity,
-          supplyDate: item.supplyDate ? new Date(item.supplyDate) : null,
-          supplier: item.supplier,
-          location: item.location,
-          temperature: item.temperature,
-          isActive: true,
-        };
+        await this.processProductItem(item);
+        processedCount++;
 
-        if (isIncremental) {
-          // При инкрементальном обновлении проверяем существование
-          await Product.findOneAndUpdate({ erpId: item.id }, productData, {
-            upsert: true,
-            new: true,
-          });
-        } else {
-          // При полной синхронизации перезаписываем
-          await Product.findOneAndUpdate({ erpId: item.id }, productData, {
-            upsert: true,
-            new: true,
-            overwrite: true,
-          });
+        // Har 100 ta mahsulotdan keyin progress ko'rsatish
+        if (processedCount % 100 === 0) {
+          console.log(`📊 ${processedCount} ta mahsulot qayta ishlandi...`);
         }
       } catch (error) {
-        console.error(`Ошибка обработки товара ${item.id}:`, error);
+        errorCount++;
+        console.error(
+          `❌ Mahsulot ${item.id || "noma'lum"} qayta ishlanmadi:`,
+          error.message
+        );
       }
     }
+
+    if (errorCount > 0) {
+      console.warn(`⚠️ ${errorCount} ta mahsulotda xatolik yuz berdi`);
+    }
+
+    return processedCount;
   }
 
-  // Обновление статистики поставщиков
+  // Bitta mahsulotni qayta ishlash
+  async processProductItem(item) {
+    if (!item.id) {
+      throw new Error("Mahsulot ID si mavjud emas");
+    }
+
+    const productData = {
+      erpId: item.id,
+      branchId: item.branchId,
+      branch: item.branch,
+      productId: item.productId,
+      batchId: item.batchId,
+      code: item.code,
+      product: item.product,
+      manufacturer: item.manufacturer,
+      country: item.country,
+      internationalName: item.internationalName,
+      pharmGroup: item.pharmGroup,
+      category: item.category,
+      unit: item.unit,
+      pieceCount: item.pieceCount,
+      barcode: item.barcode,
+      mxik: item.mxik,
+      quantity: Number(item.quantity) || 0,
+      quantities: item.quantities || {},
+      bookedQuantity: Number(item.bookedQuantity) || 0,
+      buyPrice: Number(item.buyPrice) || 0,
+      salePrice: Number(item.salePrice) || 0,
+      vat: Number(item.vat) || 0,
+      markup: Number(item.markup) || 0,
+      series: item.series,
+      shelfLife: item.shelfLife ? new Date(item.shelfLife) : null,
+      supplyQuantity: Number(item.supplyQuantity) || 0,
+      supplyDate: item.supplyDate ? new Date(item.supplyDate) : null,
+      supplier: item.supplier,
+      location: item.location,
+      temperature: item.temperature,
+      isActive: true,
+      lastUpdated: new Date(),
+    };
+
+    // Ma'lumotni yangilash yoki yangi yaratish
+    await Product.findOneAndUpdate({ erpId: item.id }, productData, {
+      upsert: true,
+      new: true,
+      runValidators: true,
+    });
+  }
+
+  // Yetkazib beruvchilar statistikasini yangilash
   async updateSupplierStatistics() {
     try {
+      console.log("📊 Yetkazib beruvchilar statistikasi yangilanmoqda...");
+
       const suppliers = await Product.distinct("supplier");
+      let updatedCount = 0;
 
       for (const supplierName of suppliers) {
         if (!supplierName) continue;
@@ -227,65 +161,175 @@ class OsonKassaSyncService {
               _id: null,
               totalProducts: { $sum: 1 },
               branches: { $addToSet: "$branch" },
+              totalQuantity: { $sum: "$quantity" },
+              totalValue: { $sum: { $multiply: ["$quantity", "$salePrice"] } },
             },
           },
         ]);
 
         if (stats.length > 0) {
-          // Проверяем существует ли поставщик
           let supplier = await Supplier.findOne({ name: supplierName });
 
           if (!supplier) {
-            // Создаем нового поставщика с автоматическим паролем
-            const username = supplierName.toLowerCase().replace(/\s+/g, "_");
+            // Yangi yetkazib beruvchi yaratish
+            const username = supplierName
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "_")
+              .substring(0, 20);
             const password = Math.random().toString(36).slice(-8);
 
             supplier = new Supplier({
               name: supplierName,
               username,
-              password, // будет хеширован в pre-save hook
+              password,
+              isActive: true,
             });
+
+            console.log(
+              `➕ Yangi yetkazib beruvchi yaratildi: ${supplierName}`
+            );
           }
 
           supplier.statistics = {
             totalProducts: stats[0].totalProducts,
             totalBranches: stats[0].branches.length,
+            totalQuantity: stats[0].totalQuantity,
+            totalValue: stats[0].totalValue,
             lastSync: new Date(),
           };
 
           await supplier.save();
+          updatedCount++;
         }
       }
+
+      console.log(
+        `✅ ${updatedCount} ta yetkazib beruvchi statistikasi yangilandi`
+      );
     } catch (error) {
-      console.error("Ошибка обновления статистики поставщиков:", error);
+      console.error(
+        "❌ Yetkazib beruvchilar statistikasini yangilashda xatolik:",
+        error
+      );
     }
   }
 
-  // Запуск планировщика
-  startScheduler() {
-    // Полная синхронизация при запуске
-    this.fullSync();
+  // Sync holatini yangilash
+  async updateSyncStatus(
+    status,
+    recordsProcessed = 0,
+    startTime = Date.now(),
+    errorMessage = null
+  ) {
+    try {
+      let syncStatus = await SyncStatus.findOne();
+      if (!syncStatus) {
+        syncStatus = new SyncStatus();
+      }
 
-    // Инкрементальная синхронизация каждые 10 минут
-    cron.schedule("*/10 * * * *", () => {
-      console.log("⏰ Запуск запланированной синхронизации");
-      this.incrementalSync();
-    });
+      syncStatus.status = status;
 
-    console.log("📅 Планировщик синхронизации запущен (каждые 10 минут)");
+      if (recordsProcessed > 0) {
+        syncStatus.lastSyncDate = new Date();
+        syncStatus.totalRecords = recordsProcessed;
+      }
+
+      if (errorMessage) {
+        syncStatus.errorMessage = errorMessage;
+      } else if (status === "completed") {
+        syncStatus.errorMessage = null;
+      }
+
+      // Bajarilish vaqtini hisoblash
+      if (startTime) {
+        syncStatus.executionTime = Date.now() - startTime;
+      }
+
+      await syncStatus.save();
+    } catch (error) {
+      console.error("❌ Sync holatini yangilashda xatolik:", error);
+    }
   }
 
-  // Получение статистики синхронизации
+  // Sinxronlash holatini olish
   async getSyncStatus() {
-    const status = await SyncStatus.findOne();
-    const productCount = await Product.countDocuments();
-    const supplierCount = await Supplier.countDocuments();
+    try {
+      const status = await SyncStatus.findOne();
+      const productCount = await Product.countDocuments();
+      const supplierCount = await Supplier.countDocuments();
 
-    return {
-      ...status?.toObject(),
-      currentProductCount: productCount,
-      currentSupplierCount: supplierCount,
-    };
+      // Oxirgi sinxronlash ma'lumotlari
+      const lastSync = await Product.findOne()
+        .sort({ lastUpdated: -1 })
+        .select("lastUpdated");
+
+      return {
+        ...status?.toObject(),
+        currentProductCount: productCount,
+        currentSupplierCount: supplierCount,
+        isRunning: this.isRunning,
+        lastProductUpdate: lastSync?.lastUpdated,
+        systemStatus: "healthy",
+      };
+    } catch (error) {
+      console.error("❌ Sinxronlash holatini olishda xatolik:", error);
+      return {
+        status: "error",
+        error: error.message,
+        isRunning: this.isRunning,
+        systemStatus: "error",
+      };
+    }
+  }
+
+  // Ma'lumotlar statistikasini olish
+  async getDataStatistics() {
+    try {
+      const [
+        totalProducts,
+        totalSuppliers,
+        activeBranches,
+        lowStockProducts,
+        recentProducts,
+      ] = await Promise.all([
+        Product.countDocuments(),
+        Supplier.countDocuments({ isActive: true }),
+        Product.distinct("branch").then((branches) => branches.length),
+        Product.countDocuments({ quantity: { $lt: 10, $gt: 0 } }),
+        Product.find().sort({ lastUpdated: -1 }).limit(5),
+      ]);
+
+      return {
+        totalProducts,
+        totalSuppliers,
+        activeBranches,
+        lowStockProducts,
+        recentProducts,
+        lastUpdate: new Date(),
+      };
+    } catch (error) {
+      console.error("❌ Statistika olishda xatolik:", error);
+      return null;
+    }
+  }
+
+  // Ma'lumotlarni tozalash (agar kerak bo'lsa)
+  async clearOldData(daysOld = 30) {
+    try {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+
+      const result = await Product.deleteMany({
+        lastUpdated: { $lt: cutoffDate },
+        quantity: 0,
+      });
+
+      console.log(`🗑️ ${result.deletedCount} ta eski mahsulot o'chirildi`);
+      return result.deletedCount;
+    } catch (error) {
+      console.error("❌ Eski ma'lumotlarni tozalashda xatolik:", error);
+      throw error;
+    }
   }
 }
 
